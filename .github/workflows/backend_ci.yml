@@ -126,6 +126,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: test_and_lint_backends
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    strategy:
+      matrix:
+        service: [product_service, order_service]
 
     steps:
     - name: Checkout repository
@@ -141,17 +144,11 @@ jobs:
     - name: Login to Azure Container Registry
       run: az acr login --name ${{ env.ACR_LOGIN_SERVER }}
 
-    # Build and Push Docker image for Product Service
-    - name: Build and Push Product Service Image
+    - name: Build and Push ${{ matrix.service }} Image
       run: |
-        docker build -t ${{ env.ACR_LOGIN_SERVER }}/product_service:latest ./backend/product_service/
-        docker push ${{ env.ACR_LOGIN_SERVER }}/product_service:latest
-
-    # Build and Push Docker image for Order Service
-    - name: Build and Push Order Service Image
-      run: |
-        docker build -t ${{ env.ACR_LOGIN_SERVER }}/order_service:latest ./backend/order_service/
-        docker push ${{ env.ACR_LOGIN_SERVER }}/order_service:latest
+          IMAGE_NAME=${{ env.ACR_LOGIN_SERVER }}/${{ matrix.service }}:${{ env.IMAGE_TAG }}
+          docker build -t "$IMAGE_NAME" "backend/${{ matrix.service }}"
+          docker push "$IMAGE_NAME"
 
     # Logout from Azure for security (runs even if image push fails)
     - name: Logout from Azure
