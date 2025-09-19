@@ -72,7 +72,32 @@ jobs:
           enable-AzPSSession: true
 
       - name: Ensure correct subscription
-        run: az account set --subscription fa0f3ccf-998f-45e8-97bd-90ac9c41fba3
+        run: |
+          az account set --subscription fa0f3ccf-998f-45e8-97bd-90ac9c41fba3
+          echo "Using subscription:"
+          az account show --query "{name:name, id:id}" -o table
+
+      - name: Resolve ACR resource ID
+        id: acr
+        run: |
+          set -e
+          ACR_ID=$(az acr show -n "${{ steps.cfg.outputs.aks_acr }}" --query id -o tsv || true)
+          if [ -z "$ACR_ID" ]; then
+            echo "found=no" >> $GITHUB_OUTPUT
+            echo "ACR not found: ${{ steps.cfg.outputs.aks_acr }} — will skip attach."
+          else
+            echo "found=yes" >> $GITHUB_OUTPUT
+            echo "id=$ACR_ID" >> $GITHUB_OUTPUT
+            echo "Resolved ACR ID: $ACR_ID"
+          fi
+
+      - name: Attach ACR (if found)
+        if: steps.acr.outputs.found == 'yes'
+        run: |
+          az aks update \
+            --name "${{ steps.cfg.outputs.aks_cluster }}" \
+            --resource-group "${{ steps.cfg.outputs.aks_rg }}" \
+            --attach-acr "${{ steps.acr.outputs.id }}"
 
       - name: Set Kubernetes context (get AKS credentials)
         run: |
