@@ -2,21 +2,24 @@ name: CD - Deploy Backend Services to AKS
 
 on:
   push:
-    branches: [ dev, main ]   # deploy automatically on dev and main
+    branches: 
+      - main
+      - dev  # deploy automatically on dev and main
+ 
   workflow_dispatch:
     inputs:
       aks_cluster_name:
         description: 'Name of the AKS Cluster to deploy to'
         required: true
-        default: 'sit722chinthikacluster'
+        default: 'w09-aks'
       aks_resource_group:
         description: 'Resource Group of the AKS Cluster'
         required: true
-        default: 'sit722chinthika-rg'
+        default: 'w09-rg'
       aks_acr_name:
         description: 'Name of ACR'
         required: true
-        default: 'w09chinthikaacr'
+        default: 'w09acr'
 
 # Defaults used for push events (workflow_dispatch will still use its inputs)
 env:
@@ -67,6 +70,9 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
           enable-AzPSSession: true
+
+      - name: Ensure correct subscription
+        run: az account set --subscription fa0f3ccf-998f-45e8-97bd-90ac9c41fba3
 
       - name: Set Kubernetes context (get AKS credentials)
         run: |
