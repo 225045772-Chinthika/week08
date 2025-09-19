@@ -102,11 +102,7 @@ jobs:
       - name: Set Kubernetes context (get AKS credentials)
         run: |
           az aks get-credentials --resource-group "${{ steps.cfg.outputs.aks_rg }}" --name "${{ steps.cfg.outputs.aks_cluster }}" --overwrite-existing
-
-      - name: Attach ACR
-        run: |
-          az aks update --name "${{ steps.cfg.outputs.aks_cluster }}" --resource-group "${{ steps.cfg.outputs.aks_rg }}" --attach-acr "${{ steps.cfg.outputs.aks_acr }}"
-
+          
       - name: Create namespace if missing
         run: |
           kubectl get ns "${{ steps.ns.outputs.namespace }}" || \
@@ -131,11 +127,11 @@ jobs:
           echo "Waiting for Product, Order LoadBalancer IPs to be assigned (up to 5 minutes)..."
           PRODUCT_IP=""
           ORDER_IP=""
-          
+
           for i in $(seq 1 60); do
             echo "Attempt $i/60 to get IPs..."
-            PRODUCT_IP=$(kubectl get service product-service-w08e1 -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-            ORDER_IP=$(kubectl get service order-service-w08e1 -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            PRODUCT_IP=$(kubectl get service product-service-w08e1 -n "${{ steps.ns.outputs.namespace }}" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            ORDER_IP=$(kubectl get service order-service-w08e1   -n "${{ steps.ns.outputs.namespace }}" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
 
             if [[ -n "$PRODUCT_IP" && -n "$ORDER_IP" ]]; then
               echo "All backend LoadBalancer IPs assigned!"
@@ -143,16 +139,12 @@ jobs:
               echo "Order Service IP: $ORDER_IP"
               break
             fi
-            sleep 5 # Wait 5 seconds before next attempt
+            sleep 5
           done
-          
           if [[ -z "$PRODUCT_IP" || -z "$ORDER_IP" ]]; then
             echo "Error: One or more LoadBalancer IPs not assigned after timeout."
-            exit 1 # Fail the job if IPs are not obtained
+            exit 1
           fi
-          
-          # These are environment variables for subsequent steps in the *same job*
-          # And used to set the job outputs
           echo "PRODUCT_IP=$PRODUCT_IP" >> $GITHUB_ENV
           echo "ORDER_IP=$ORDER_IP" >> $GITHUB_ENV
 
