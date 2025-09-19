@@ -1,6 +1,8 @@
 name: CD - Deploy Backend Services to AKS
 
 on:
+  push:
+    branches: [ dev, main ]   # deploy automatically on dev and main
   workflow_dispatch:
     inputs:
       aks_cluster_name:
@@ -14,12 +16,18 @@ on:
       aks_acr_name:
         description: 'Name of ACR'
         required: true
-        default: 'sit722chinthikaacr'
+        default: 'w09chinthikaacr'
+
+# Defaults used for push events (workflow_dispatch will still use its inputs)
+env:
+  AKS_CLUSTER_NAME: w09-aks
+  AKS_RESOURCE_GROUP: w09-rg
+  AKS_ACR_NAME: w09acr
 
 jobs:
   deploy_backend:
     runs-on: ubuntu-latest
-    environment: Production
+    environment: ${{ github.ref == 'refs/heads/main' && 'Production' || 'development' }}
     
     outputs:
       PRODUCT_API_IP: ${{ steps.get_product_ip.outputs.external_ip }}
@@ -28,7 +36,32 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+ 
+      # Resolve AKS/ACR values depending on event type
+      - name: Resolve deployment inputs
+        id: cfg
+        run: |
+          # If workflow_dispatch: use typed inputs; else use env defaults
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "aks_cluster=${{ github.event.inputs.aks_cluster_name }}" >> $GITHUB_OUTPUT
+            echo "aks_rg=${{ github.event.inputs.aks_resource_group }}" >> $GITHUB_OUTPUT
+            echo "aks_acr=${{ github.event.inputs.aks_acr_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "aks_cluster=${{ env.AKS_CLUSTER_NAME }}" >> $GITHUB_OUTPUT
+            echo "aks_rg=${{ env.AKS_RESOURCE_GROUP }}" >> $GITHUB_OUTPUT
+            echo "aks_acr=${{ env.AKS_ACR_NAME }}" >> $GITHUB_OUTPUT
+          fi
 
+      # Choose namespace by branch: dev -> dev, main -> prod
+      - name: Set target namespace
+        id: ns
+        run: |
+          if [ "${GITHUB_REF##*/}" = "main" ]; then
+            echo "namespace=prod" >> $GITHUB_OUTPUT
+          else
+            echo "namespace=dev" >> $GITHUB_OUTPUT
+          fi
+  
       - name: Log in to Azure
         uses: azure/login@v1
         with:
@@ -37,27 +70,30 @@ jobs:
 
       - name: Set Kubernetes context (get AKS credentials)
         run: |
-          az aks get-credentials --resource-group ${{ github.event.inputs.aks_resource_group }} --name ${{ github.event.inputs.aks_cluster_name }} --overwrite-existing
+          az aks get-credentials --resource-group "${{ steps.cfg.outputs.aks_rg }}" --name "${{ steps.cfg.outputs.aks_cluster }}" --overwrite-existing
 
       - name: Attach ACR
         run: |
-          az aks update --name ${{ github.event.inputs.aks_cluster_name }} --resource-group ${{ github.event.inputs.aks_resource_group }} --attach-acr ${{ github.event.inputs.aks_acr_name }}
+          az aks update --name "${{ steps.cfg.outputs.aks_cluster }}" --resource-group "${{ steps.cfg.outputs.aks_rg }}" --attach-acr "${{ steps.cfg.outputs.aks_acr }}"
 
+      - name: Create namespace if missing
+        run: |
+          kubectl get ns "${{ steps.ns.outputs.namespace }}" || \
+          kubectl create ns "${{ steps.ns.outputs.namespace }}"
+ 
       - name: Deploy Backend Infrastructure (Namespace, ConfigMaps, Secrets, Databases)
         run: |
           echo "Deploying backend infrastructure..."
-          cd k8s/
-          kubectl apply -f configmaps.yaml
-          kubectl apply -f secrets.yaml
-          kubectl apply -f product-db.yaml
-          kubectl apply -f order-db.yaml
+          kubectl apply -f k8s/configmaps.yaml -n "${{ steps.ns.outputs.namespace }}"
+          kubectl apply -f k8s/secrets.yaml    -n "${{ steps.ns.outputs.namespace }}"
+          kubectl apply -f k8s/product-db.yaml -n "${{ steps.ns.outputs.namespace }}"
+          kubectl apply -f k8s/order-db.yaml   -n "${{ steps.ns.outputs.namespace }}"
 
       - name: Deploy Backend Microservices (Product, Order)
         run: |
           echo "Deploying backend microservices..."
-          cd k8s/
-          kubectl apply -f product-service.yaml
-          kubectl apply -f order-service.yaml
+          kubectl apply -f k8s/product-service.yaml -n "${{ steps.ns.outputs.namespace }}"
+          kubectl apply -f k8s/order-service.yaml   -n "${{ steps.ns.outputs.namespace }}"
       
       - name: Wait for Backend LoadBalancer IPs
         run: |
