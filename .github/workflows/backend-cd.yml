@@ -87,6 +87,12 @@ jobs:
         run: |
           echo "Skipping Attach ACR (cluster already linked)."
 
+      - name: Deploy Backend Microservices (Product, Order)
+        shell: bash
+        run: |
+          kubectl apply -f k8s/product-service.yaml -n ${{ steps.ns.outputs.namespace }}
+          kubectl apply -f k8s/order-service.yaml   -n ${{ steps.ns.outputs.namespace }}
+
       - name: Wait for Backend LoadBalancer IPs
         shell: bash
         run: |
