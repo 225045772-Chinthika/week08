@@ -1,4 +1,5 @@
 # week08/.github/workflows/frontend-cd.yml
+# Change 4 proof: branch→environment mapping (dev→development, main→production with approval)
 
 name: CD - Deploy Frontend to AKS
 
