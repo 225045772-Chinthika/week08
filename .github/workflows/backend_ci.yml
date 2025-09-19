@@ -112,9 +112,10 @@ jobs:
         uses: actions/checkout@v4
 
       # PRs: produce a green context without pushing images
-      - name: PR mode — skip image publish
-        if: github.event_name == 'pull_request'
-        run: echo "PR build for ${{ matrix.service }}: skipping ACR publish"
+      - name: PR mode - skip image publish
+        if: ${{ github.event_name == 'pull_request' }}
+        run: |
+          echo "PR build for ${{ matrix.service }}: skipping ACR publish"
 
       # Push to main: publish images
       - name: Azure Login
@@ -135,5 +136,5 @@ jobs:
           docker push "$IMAGE_NAME"
 
       - name: Logout from Azure
-        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: az logout
