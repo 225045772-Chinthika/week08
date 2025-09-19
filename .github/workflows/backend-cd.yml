@@ -81,12 +81,22 @@ jobs:
 
       # Attach ACR (works with either inputs or secrets thanks to the step above)
       - name: Attach ACR
-        if: ${{ steps.aks.outputs.acr != '' }}
+        shell: bash
         run: |
+          echo "Resolving ACR resource ID for: ${{ steps.aks.outputs.acr }}"
+          ACR_ID=$(az acr show -n "${{ steps.aks.outputs.acr }}" --query id -o tsv 2>/dev/null || true)
+
+          if [ -z "$ACR_ID" ]; then
+            echo "ERROR: Could not find ACR named '${{ steps.aks.outputs.acr }}' in the current subscription."
+            echo "Tip: Set secret ACR_NAME to the short name (e.g., w09acr) and make sure that registry exists."
+            exit 1
+          fi
+
+          echo "Attaching ACR: $ACR_ID to AKS: ${{ steps.aks.outputs.cluster }} (RG: ${{ steps.aks.outputs.rg }})"
           az aks update \
             --name "${{ steps.aks.outputs.cluster }}" \
             --resource-group "${{ steps.aks.outputs.rg }}" \
-            --attach-acr "${{ steps.aks.outputs.acr }}"
+            --attach-acr "$ACR_ID"
 
       - name: Wait for Backend LoadBalancer IPs
         shell: bash
