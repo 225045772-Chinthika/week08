@@ -5,89 +5,144 @@ name: CD - Deploy Frontend to AKS
 # This workflow can be called by other workflows and takes inputs.
 # Or it can be run manually if you provide the IPs.
 on:
+  push:
+    branches: [ dev, main ]
   workflow_dispatch:
     inputs:
       product_api_ip:
-        description: 'External IP of Product Service'
-        required: true
-        default: 'http://<ip_address>:8000'
+        description: 'External IP of Product Service (e.g., http://X.X.X.X:8000)'
+        required: false
       order_api_ip:
         description: 'External IP of Order Service (e.g., http://Y.Y.Y.Y:8001)'
-        required: true
-        default: 'http://<ip_address>:8001'
+        required: false
       aks_cluster_name:
-        description: 'Name of the AKS Cluster to deploy to'
-        required: true
-        default: 'sit722chinthikacluster'
+        description: 'AKS Cluster (optional override)'
+        required: false
       aks_resource_group:
-        description: 'Resource Group of the AKS Cluster'
-        required: true
-        default: 'sit722chinthika-rg'
+        description: 'AKS Resource Group (optional override)'
+        required: false
 
   workflow_call:
     inputs:
       product_api_ip:
-        required: true
+        required: false
         type: string
       order_api_ip:
-        required: true
+        required: false
         type: string
       aks_cluster_name:
-        required: true
+        required: false
         type: string
       aks_resource_group:
-        required: true
+        required: false
         type: string
+
+concurrency:
+  group: deploy-frontend-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   deploy_frontend:
     runs-on: ubuntu-latest
-    environment: Production
+    environment: ${{ github.ref == 'refs/heads/main' && 'Production' || 'development' }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Azure login using a Service Principal secret
       - name: Azure Login
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # Login to Azure Container Registry (ACR)
-      - name: Login to Azure Container Registry
-        run: az acr login --name ${{ secrets.AZURE_CONTAINER_REGISTRY }}
-
-      - name: Inject Backend IPs into Frontend main.js
+      # Decide namespace based on branch
+      - name: Set target namespace
+        id: ns
+        shell: bash
         run: |
-          echo "Injecting IPs into frontend/static/js/main.js"
-          # Ensure frontend/main.js is directly in the path for sed
-          sed -i "s|_PRODUCT_API_URL_|${{ inputs.product_api_ip }}|g" frontend/main.js
-          sed -i "s|_ORDER_API_URL_|${{ inputs.order_api_ip }}|g" frontend/main.js
-          
-          # Display the modified file content for debugging
-          echo "--- Modified main.js content ---"
-          cat frontend/main.js
-          echo "---------------------------------"
+          if [ "${GITHUB_REF##*/}" = "main" ]; then
+            echo "namespace=prod" >> "$GITHUB_OUTPUT"
+          else
+            echo "namespace=dev" >> "$GITHUB_OUTPUT"
+          fi
 
-      # Build and Push Docker image for Frontend
-      - name: Build and Push Frontend Image
+      # Resolve AKS and ACR settings (use inputs when workflow_dispatch/workflow_call, otherwise secrets)
+      - name: Resolve platform settings
+        id: platform
+        shell: bash
         run: |
-          docker build -t ${{ secrets.AZURE_CONTAINER_REGISTRY }}/frontend:latest ./frontend/
-          docker push ${{ secrets.AZURE_CONTAINER_REGISTRY }}/frontend:latest
+          CLUSTER="${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.aks_cluster_name || secrets.AKS_CLUSTER }}"
+          RG="${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.aks_resource_group || secrets.AKS_RG }}"
+          ACR_NAME="${{ secrets.ACR_NAME }}"
+          ACR_LOGIN="${{ secrets.ACR_LOGIN_SERVER }}"
+          echo "cluster=$CLUSTER" >> "$GITHUB_OUTPUT"
+          echo "rg=$RG" >> "$GITHUB_OUTPUT"
+          echo "acr_name=$ACR_NAME" >> "$GITHUB_OUTPUT"
+          echo "acr_login=$ACR_LOGIN" >> "$GITHUB_OUTPUT"
 
       - name: Set Kubernetes context (get AKS credentials)
-        uses: azure/aks-set-context@v3
-        with:
-          resource-group: ${{ inputs.aks_resource_group }}
-          cluster-name: ${{ inputs.aks_cluster_name }}
+        run: |
+          az aks get-credentials \
+            --resource-group "${{ steps.platform.outputs.rg }}" \
+            --name "${{ steps.platform.outputs.cluster }}" \
+            --overwrite-existing
+
+      # If caller provided API IPs via inputs, use them; else discover from Services
+      - name: Discover backend IPs if not provided
+        id: backend_ips
+        shell: bash
+        run: |
+          PRODUCT_IP="${{ inputs.product_api_ip }}"
+          ORDER_IP="${{ inputs.order_api_ip }}"
+
+          if [ -z "$PRODUCT_IP" ] || [ -z "$ORDER_IP" ]; then
+            echo "Inputs not provided; discovering LoadBalancer IPs from services in namespace ${{ steps.ns.outputs.namespace }}..."
+            # Update these service names if yours differ:
+            PROD_SVC="product-service-w08e1"
+            ORDER_SVC="order-service-w08e1"
+
+            P_IP=$(kubectl get svc "$PROD_SVC" -n "${{ steps.ns.outputs.namespace }}" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            O_IP=$(kubectl get svc "$ORDER_SVC" -n "${{ steps.ns.outputs.namespace }}" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+
+            if [ -z "$P_IP" ] || [ -z "$O_IP" ]; then
+              echo "Error: Could not resolve both backend service IPs. Make sure services exist and are of type LoadBalancer."
+              exit 1
+            fi
+
+            # Build full URLs with ports expected by the frontend
+            PRODUCT_IP="http://$P_IP:8000"
+            ORDER_IP="http://$O_IP:8001"
+          fi
+
+          echo "product_url=$PRODUCT_IP" >> "$GITHUB_OUTPUT"
+          echo "order_url=$ORDER_IP" >> "$GITHUB_OUTPUT"
+          echo "Resolved Product API: $PRODUCT_IP"
+          echo "Resolved Order API: $ORDER_IP"
+
+      # Build and push the frontend image
+      - name: Login to Azure Container Registry
+        run: az acr login --name "${{ steps.platform.outputs.acr_name }}"
+
+      - name: Build and Push Frontend Image
+        run: |
+          docker build -t "${{ steps.platform.outputs.acr_login }}/frontend:latest" ./frontend/
+          docker push "${{ steps.platform.outputs.acr_login }}/frontend:latest"
+
+      # Inject discovered/provided API URLs into the frontend
+      - name: Inject Backend IPs into frontend/main.js
+        shell: bash
+        run: |
+          echo "Injecting API URLs into frontend/main.js"
+          sed -i "s|_PRODUCT_API_URL_|${{ steps.backend_ips.outputs.product_url }}|g" frontend/main.js
+          sed -i "s|_ORDER_API_URL_|${{ steps.backend_ips.outputs.order_url }}|g" frontend/main.js
+          echo "--- Modified main.js (head) ---"
+          head -n 50 frontend/main.js || true
 
       - name: Deploy Frontend to AKS
+        working-directory: k8s
         run: |
-          echo "Deploying frontend with latest tag to AKS cluster: ${{ inputs.aks_cluster_name }}"
-          cd k8s/
-          # Ensure frontend-service.yaml is configured with your ACR
-          kubectl apply -f frontend.yaml
+          # Ensure frontend manifests reference the pushed image from your ACR login server
+          kubectl apply -f frontend.yaml -n "${{ steps.ns.outputs.namespace }}"
 
-      - name: Logout from Azure (AKS deployment)
+      - name: Logout from Azure
         run: az logout

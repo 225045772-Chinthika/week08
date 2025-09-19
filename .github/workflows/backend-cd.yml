@@ -1,25 +1,28 @@
 name: CD - Deploy Backend Services to AKS
 
 on:
+  push:
+    branches: [ dev, main ]
   workflow_dispatch:
     inputs:
       aks_cluster_name:
         description: 'Name of the AKS Cluster to deploy to'
-        required: true
-        default: 'sit722chinthikacluster'
+        required: false
       aks_resource_group:
         description: 'Resource Group of the AKS Cluster'
-        required: true
-        default: 'sit722chinthika-rg'
+        required: false
       aks_acr_name:
         description: 'Name of ACR'
-        required: true
-        default: 'sit722chinthikaacr'
+        required: false
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   deploy_backend:
     runs-on: ubuntu-latest
-    environment: Production
+    environment: ${{ github.ref == 'refs/heads/main' && 'Production' || 'development' }}
     
     outputs:
       PRODUCT_API_IP: ${{ steps.get_product_ip.outputs.external_ip }}
@@ -35,67 +38,91 @@ jobs:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
           enable-AzPSSession: true
 
+      - name: Set target namespace
+        id: ns
+        run: |
+          if [ "${GITHUB_REF##*/}" = "main" ]; then
+            echo "namespace=prod" >> $GITHUB_OUTPUT
+          else
+            echo "namespace=dev" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Resolve AKS settings (inputs or secrets)
+        id: aks
+        shell: bash
+        run: |
+          # Fallback to secrets for push runs; use workflow_dispatch inputs when provided
+          CLUSTER="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.aks_cluster_name || secrets.AKS_CLUSTER }}"
+          RG="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.aks_resource_group || secrets.AKS_RG }}"
+          ACR="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.aks_acr_name || secrets.ACR_NAME }}"
+          echo "cluster=$CLUSTER" >> "$GITHUB_OUTPUT"
+          echo "rg=$RG"         >> "$GITHUB_OUTPUT"
+          echo "acr=$ACR"       >> "$GITHUB_OUTPUT"
+
       - name: Set Kubernetes context (get AKS credentials)
         run: |
-          az aks get-credentials --resource-group ${{ github.event.inputs.aks_resource_group }} --name ${{ github.event.inputs.aks_cluster_name }} --overwrite-existing
+          az aks get-credentials \
+            --resource-group "${{ steps.aks.outputs.rg }}" \
+            --name "${{ steps.aks.outputs.cluster }}" \
+            --overwrite-existing
 
-      - name: Attach ACR
-        run: |
-          az aks update --name ${{ github.event.inputs.aks_cluster_name }} --resource-group ${{ github.event.inputs.aks_resource_group }} --attach-acr ${{ github.event.inputs.aks_acr_name }}
+      # Optional but recommended: ensure namespace exists
+      - name: Create namespace if missing
+        run: kubectl get ns "${{ steps.ns.outputs.namespace }}" || kubectl create ns "${{ steps.ns.outputs.namespace }}"
 
+      # Apply infra (configmaps, secrets, DBs) to the chosen namespace
       - name: Deploy Backend Infrastructure (Namespace, ConfigMaps, Secrets, Databases)
+        working-directory: k8s
         run: |
-          echo "Deploying backend infrastructure..."
-          cd k8s/
-          kubectl apply -f configmaps.yaml
-          kubectl apply -f secrets.yaml
-          kubectl apply -f product-db.yaml
-          kubectl apply -f order-db.yaml
+          kubectl apply -f configmaps.yaml   -n "${{ steps.ns.outputs.namespace }}"
+          kubectl apply -f secrets.yaml      -n "${{ steps.ns.outputs.namespace }}"
+          kubectl apply -f product-db.yaml   -n "${{ steps.ns.outputs.namespace }}"
+          kubectl apply -f order-db.yaml     -n "${{ steps.ns.outputs.namespace }}"
 
-      - name: Deploy Backend Microservices (Product, Order)
+      # Attach ACR (works with either inputs or secrets thanks to the step above)
+      - name: Attach ACR
+        if: ${{ steps.aks.outputs.acr != '' }}
         run: |
-          echo "Deploying backend microservices..."
-          cd k8s/
-          kubectl apply -f product-service.yaml
-          kubectl apply -f order-service.yaml
-      
+          az aks update \
+            --name "${{ steps.aks.outputs.cluster }}" \
+            --resource-group "${{ steps.aks.outputs.rg }}" \
+            --attach-acr "${{ steps.aks.outputs.acr }}"
+
       - name: Wait for Backend LoadBalancer IPs
+        shell: bash
         run: |
-          echo "Waiting for Product, Order LoadBalancer IPs to be assigned (up to 5 minutes)..."
+          echo "Waiting for Product and Order LoadBalancer IPs to be assigned (up to 5 minutes)..."
           PRODUCT_IP=""
           ORDER_IP=""
-          
+
           for i in $(seq 1 60); do
             echo "Attempt $i/60 to get IPs..."
-            PRODUCT_IP=$(kubectl get service product-service-w08e1 -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-            ORDER_IP=$(kubectl get service order-service-w08e1 -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-
+            PRODUCT_IP=$(kubectl get service product-service-w08e1 -n "${{ steps.ns.outputs.namespace }}" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            ORDER_IP=$(kubectl get service order-service-w08e1   -n "${{ steps.ns.outputs.namespace }}" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
             if [[ -n "$PRODUCT_IP" && -n "$ORDER_IP" ]]; then
               echo "All backend LoadBalancer IPs assigned!"
               echo "Product Service IP: $PRODUCT_IP"
               echo "Order Service IP: $ORDER_IP"
               break
             fi
-            sleep 5 # Wait 5 seconds before next attempt
+            sleep 5
           done
-          
+
           if [[ -z "$PRODUCT_IP" || -z "$ORDER_IP" ]]; then
             echo "Error: One or more LoadBalancer IPs not assigned after timeout."
-            exit 1 # Fail the job if IPs are not obtained
+            exit 1
           fi
-          
-          # These are environment variables for subsequent steps in the *same job*
-          # And used to set the job outputs
-          echo "PRODUCT_IP=$PRODUCT_IP" >> $GITHUB_ENV
-          echo "ORDER_IP=$ORDER_IP" >> $GITHUB_ENV
+
+          echo "PRODUCT_IP=$PRODUCT_IP" >> "$GITHUB_ENV"
+          echo "ORDER_IP=$ORDER_IP"     >> "$GITHUB_ENV"
 
       - name: Capture Product Service IP for Workflow Output
         id: get_product_ip
-        run: echo "external_ip=${{ env.PRODUCT_IP }}" >> $GITHUB_OUTPUT
-      
+        run: echo "external_ip=${{ env.PRODUCT_IP }}" >> "$GITHUB_OUTPUT"
+
       - name: Capture Order Service IP for Workflow Output
         id: get_order_ip
-        run: echo "external_ip=${{ env.ORDER_IP }}" >> $GITHUB_OUTPUT
+        run: echo "external_ip=${{ env.ORDER_IP }}" >> "$GITHUB_OUTPUT"
 
       - name: Logout from Azure
         run: az logout
