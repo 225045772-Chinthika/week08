@@ -119,37 +119,41 @@ jobs:
 
   # Job 2: Build and Push Docker Images (runs only if tests pass)
   build_and_push_images:
+    name: build_and_push_images (${{ matrix.service }})   # <— gives contexts like (product_service)
     runs-on: ubuntu-latest
     needs: test_and_lint_backends
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [product_service, order_service]
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    # Azure login using a Service Principal secret
-    - name: Azure Login
-      uses: azure/login@v1
-      with:
-        creds: ${{ secrets.AZURE_CREDENTIALS }} # Needs to be set as a GitHub Secret (Service Principal JSON)
+      # PRs: report a green status without publishing
+      - name: PR mode — skip image publish
+        if: github.event_name == 'pull_request'
+        run: echo "PR build for ${{ matrix.service }}: skipping ACR publish"
 
-    # Login to Azure Container Registry (ACR)
-    - name: Login to Azure Container Registry
-      run: az acr login --name ${{ env.ACR_LOGIN_SERVER }}
+      # Push to main: do the real publish
+      - name: Azure Login
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-    # Build and Push Docker image for Product Service
-    - name: Build and Push Product Service Image
-      run: |
-        docker build -t ${{ env.ACR_LOGIN_SERVER }}/product_service:latest ./backend/product_service/
-        docker push ${{ env.ACR_LOGIN_SERVER }}/product_service:latest
+      - name: Login to Azure Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: az acr login --name ${{ env.ACR_NAME }}
 
-    # Build and Push Docker image for Order Service
-    - name: Build and Push Order Service Image
-      run: |
-        docker build -t ${{ env.ACR_LOGIN_SERVER }}/order_service:latest ./backend/order_service/
-        docker push ${{ env.ACR_LOGIN_SERVER }}/order_service:latest
+      - name: Build and Push ${{ matrix.service }} Image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          IMAGE_NAME=${{ env.ACR_LOGIN_SERVER }}/${{ matrix.service }}:${{ env.IMAGE_TAG }}
+          docker build -t "$IMAGE_NAME" "backend/${{ matrix.service }}"
+          docker push "$IMAGE_NAME"
 
-    # Logout from Azure for security (runs even if image push fails)
-    - name: Logout from Azure
-      run: az logout
-      if: always()
+      - name: Logout from Azure
+        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: az logout
